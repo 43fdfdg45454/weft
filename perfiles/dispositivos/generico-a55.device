@@ -1,0 +1,20 @@
+# Perfil de dispositivo integrado (ver generico-a78.device para el formato).
+dispositivo.formato=1
+dispositivo.id=generico-a55
+dispositivo.nombre=Genérico A55
+dispositivo.descripcion=Núcleo de bajo consumo ARMv8.2 (Cortex-A55 r2p0): el mínimo habitual de los teléfonos de gama baja.
+
+producto.fabricante=
+producto.marca=
+producto.modelo=
+producto.dispositivo=
+producto.nombre=
+
+maquina.nucleos=4
+maquina.ram=4096
+pagina=4
+
+cpu.nombre=Cortex-A55
+cpu.base=cortex-a55
+cpu.midr=0x412fd050
+cpu.features=fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp

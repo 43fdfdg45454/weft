@@ -1,0 +1,840 @@
+# Unico pipeline: las tareas corren en paralelo y la ultima junta los resultados y publica la version.
+name: ci
+'on':
+  push:
+    branches:
+    - main
+  workflow_dispatch:
+    inputs:
+      heddle_ref:
+        description: 'Rama, etiqueta o commit de 43fdfdg45454/heddle que se compila y prueba en Android (vacio: la ultima release)'
+        required: false
+        default: ''
+# Permisos minimos: el token solo lee el repositorio; las tareas resultados y version (las unicas que publican releases) piden
+# contents: write ellas mismas. Los checkout no guardan el token en .git/config (persist-credentials: false), salvo el de version,
+# que consulta las etiquetas del remoto.
+permissions:
+  contents: read
+# Dos pushes seguidos no corren a la vez (semver calcularia la misma version dos veces y resultados pisaria el release ci del otro):
+# el segundo espera a que termine el primero, sin cancelarlo a medias.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  # commits de gfxstream y rutabaga_gfx que compilan qemu-ubuntu (via ci/build-qemu.sh, que los recibe por el entorno) y
+  # bibliotecas-fedora: DEBEN coincidir con los del manifiesto flatpak/plantillas/app.yml.in (el paquete Flatpak compila los mismos)
+  GFXSTREAM_REF: 07ee40efb0e7037a9a9b7fe59071e7c4997e7cbe
+  RUTABAGA_REF: ced6af5b1135173c269a037e06213e8a263de271
+jobs:
+  # semver: la version de este pipeline la calcula GitVersion (GitVersion.yml) a partir de las etiquetas vX.Y.Z y la historia.
+  # base (el binario) y flatpak la incrustan (WEFT_VERSION); version la publica como etiqueta vX.Y.Z.
+  semver:
+    name: version (GitVersion)
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.gv.outputs.semVer }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: gittools/actions/gitversion/setup@7417b1089e2c7de93510f1901d656ddf60bb024f # v4.7.0
+      with:
+        versionSpec: '6.8.2'
+    - id: gv
+      uses: gittools/actions/gitversion/execute@7417b1089e2c7de93510f1901d656ddf60bb024f # v4.7.0
+    - run: 'echo "Version: ${{ steps.gv.outputs.semVer }} (${{ steps.gv.outputs.fullSemVer }})"'
+  base:
+    name: unitarias y maquina minima
+    needs: semver
+    runs-on: ubuntu-24.04
+    outputs:
+      kvm: ${{ steps.kvm.outputs.kvm }}
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Compilar y pruebas unitarias
+      env:
+        WEFT_VERSION: ${{ needs.semver.outputs.version }}
+      run: |
+        cargo build --release
+        cargo test --release
+        # bucles que nunca iteran: error. El resto de avisos de clippy aun no son errores (hay muchos en la ventana)
+        cargo clippy --release --all-targets -- -D clippy::never_loop
+    - name: QEMU, KVM e invitado de prueba
+      id: kvm
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq qemu-system-x86 busybox-static cpio
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        sleep 1
+        # sin KVM (ejecutor sin virtualizacion anidada) no se falla aqui: se omite la prueba con KVM y se avisa
+        if [ -e /dev/kvm ]; then echo "kvm=si" >> "$GITHUB_OUTPUT"; else echo "kvm=no" >> "$GITHUB_OUTPUT"; echo "::warning title=Sin KVM::este ejecutor no tiene /dev/kvm: se omiten las pruebas que lo necesitan y la version no se publica"; fi
+        ls -l /dev/kvm || true
+        mkdir -p ci/out
+        sudo cp "/boot/vmlinuz-$(uname -r)" ci/out/vmlinuz
+        sudo chmod 644 ci/out/vmlinuz
+        ci/make-guest.sh "$(command -v busybox)" ci/out/guest.cpio.gz
+        qemu-system-x86_64 --version | head -n1
+    - name: Prueba de extremo a extremo (KVM)
+      if: steps.kvm.outputs.kvm == 'si'
+      run: |
+        set -o pipefail
+        mkdir -p res
+        WEFT_E2E=1 WEFT_ACCEL=kvm WEFT_KEEP="$PWD/res/pantalla-kvm.png" WEFT_KERNEL="$PWD/ci/out/vmlinuz" WEFT_INITRD="$PWD/ci/out/guest.cpio.gz" \
+          cargo test --release --test e2e -- --nocapture 2>&1 | tee res/e2e-kvm.txt
+    - name: Prueba de extremo a extremo (sin aceleracion)
+      run: |
+        set -o pipefail
+        WEFT_E2E=1 WEFT_ACCEL=tcg WEFT_KERNEL="$PWD/ci/out/vmlinuz" WEFT_INITRD="$PWD/ci/out/guest.cpio.gz" \
+          cargo test --release --test e2e -- --nocapture 2>&1 | tee res/e2e-tcg.txt
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-base
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+    - name: Guardar el ejecutable
+      uses: actions/upload-artifact@v4
+      with:
+        name: binario
+        path: target/release/weft
+        retention-days: 3
+  qemu-ubuntu:
+    # El QEMU con gfxstream que usa la tarea cuttlefish (Ubuntu no trae virtio-gpu-rutabaga). Se compila aqui, con ci/build-qemu.sh, y se
+    # guarda en la cache de Actions (clave = el guion, la version de QEMU y los commits de gfxstream y rutabaga): despues del primer
+    # pipeline casi no cuesta nada. Este
+    # repositorio no depende de ninguna release de otro repositorio para esto.
+    name: QEMU con gfxstream para Ubuntu (compilado o de la cache)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      QEMU_REF: v10.0.2
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Cache del QEMU ya compilado
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: paquete
+        key: qemu-gfxstream-${{ env.QEMU_REF }}-${{ env.GFXSTREAM_REF }}-${{ env.RUTABAGA_REF }}-${{ hashFiles('ci/build-qemu.sh') }}
+    - name: Compilar
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash {0}
+      run: |
+        mkdir -p res
+        ci/build-qemu.sh "$QEMU_REF" "$PWD/paquete" > res/compilacion.txt 2>&1
+        echo "resultado=$?" | tee -a res/compilacion.txt
+        tail -n 60 res/compilacion.txt
+        grep -E "^(=== |FALLO|resultado)" res/compilacion.txt > res/resumen.txt
+        test -x paquete/bin/qemu-system-x86_64
+    - name: Comprobar el binario
+      shell: bash {0}
+      run: |
+        mkdir -p res
+        # con la cache no pasa por build-qemu.sh (que instala los -dev): se instalan las bibliotecas de ejecucion del QEMU propio
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq libpulse0 libsdl2-2.0-0 libslirp0 libegl1 libgl1 libvulkan1 libgtk-3-0 libvte-2.91-0 libepoxy0 libpipewire-0.3-0 libusb-1.0-0 libfdt1 libaio1t64 libcap-ng0 libseccomp2 libsndio7.0 2>&1 | tail -n 2
+        {
+          LD_LIBRARY_PATH="$PWD/paquete/lib" paquete/bin/qemu-system-x86_64 --version | head -n1
+          echo "rutabaga:"; LD_LIBRARY_PATH="$PWD/paquete/lib" paquete/bin/qemu-system-x86_64 -device help 2>&1 | grep -i rutabaga
+          echo "bibliotecas que faltan:"; LD_LIBRARY_PATH="$PWD/paquete/lib" ldd paquete/bin/qemu-system-x86_64 | grep -i "not found"
+          du -sh paquete
+        } 2>&1 | tee res/binario.txt
+        LD_LIBRARY_PATH="$PWD/paquete/lib" paquete/bin/qemu-system-x86_64 -device help 2>&1 | grep -qi rutabaga
+    - name: Empaquetar (un .tar.gz conserva los enlaces simbolicos)
+      run: tar -czf qemu-propio.tar.gz -C paquete . && ls -l qemu-propio.tar.gz
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-qemu
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+    - name: Guardar el QEMU
+      uses: actions/upload-artifact@v4
+      with:
+        name: qemu-propio
+        path: qemu-propio.tar.gz
+        retention-days: 3
+  cuttlefish:
+    name: Android completo en Ubuntu (gfxstream, heddle, app de prueba)
+    needs: qemu-ubuntu
+    runs-on: ubuntu-24.04
+    outputs:
+      kvm: ${{ steps.kvm.outputs.kvm }}
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: QEMU con gfxstream (de la tarea qemu-ubuntu)
+      uses: actions/download-artifact@v4
+      with:
+        name: qemu-propio
+        path: qemu-dl
+    - name: KVM, vsock y herramientas
+      id: kvm
+      shell: bash {0}
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+        sudo modprobe vgem; sudo chmod 666 /dev/dri/* 2>/dev/null; ls -l /dev/dri/ 2>&1
+        sudo modprobe vhost_vsock; sudo chmod 666 /dev/vhost-vsock; ls -l /dev/kvm /dev/vhost-vsock
+        if [ -e /dev/kvm ]; then echo "kvm=si" >> "$GITHUB_OUTPUT"; else echo "kvm=no" >> "$GITHUB_OUTPUT"; echo "::warning title=Sin KVM::este ejecutor no tiene /dev/kvm: se omiten las pruebas que lo necesitan y la version no se publica"; fi
+        sudo curl -fsSL https://us-apt.pkg.dev/doc/repo-signing-key.gpg -o /etc/apt/trusted.gpg.d/artifact-registry.asc
+        echo "deb https://us-apt.pkg.dev/projects/android-cuttlefish-artifacts android-cuttlefish main" | sudo tee /etc/apt/sources.list.d/cuttlefish.list
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq qemu-system-x86 virtiofsd libpulse0 libsdl2-2.0-0 libslirp0 libegl1 libgl1 libvulkan1 mesa-vulkan-drivers libgtk-3-0 libvte-2.91-0 libepoxy0 libpipewire-0.3-0 libusb-1.0-0 libfdt1 libaio1t64 libcap-ng0 libseccomp2 libsndio7.0 cuttlefish-base 2>&1 | tail -n 2
+        qemu-system-x86_64 --version | head -n1; ls -l /usr/libexec/virtiofsd /dev/udmabuf 2>&1
+        # weft usa su propio adb (vsock): esta tarea no instala ni pone en el PATH el adb de Google
+        echo "adb instalado por paquetes: $(dpkg -l 2>/dev/null | grep -c -E '^ii +(adb|android-tools-adb|android-sdk-platform-tools)')"; command -v adb || echo "adb: no esta en el PATH"
+    - name: Descarga de la imagen de Google
+      shell: bash {0}
+      run: |
+        mkdir -p cf res
+        # compilacion fija de la imagen (16373615, la misma que baja scripts/dev-fedora.sh por defecto): la prueba no cambia sola
+        # cuando Google publique otra "latest"
+        cvd fetch --default_build=16373615/aosp_cf_x86_64_only_phone-userdebug --target_directory="$PWD/cf" 2>&1 | tail -n 3 | cut -c1-200
+    - name: Traductor ARM (heddle) y banco de pruebas (x86_64 y arm64)
+      shell: bash {0}
+      env:
+        HEDDLE_REF: ${{ github.event.inputs.heddle_ref }}
+      run: |
+        mkdir -p arm res
+        {
+          if [ -n "$HEDDLE_REF" ]; then
+            # lanzado a mano con heddle_ref: se compila esa version de heddle (como su propio CI: biblioteca guest y
+            # biblioteca para x86_64 Android) para probarla en este Android antes de publicarla
+            ci/build-heddle.sh "$HEDDLE_REF" arm/libheddle.so; echo "heddle $HEDDLE_REF compilado -> $?"
+          else
+            # la ultima release de heddle (cada push a su main que pasa su CI publica una): asi se prueba en Android lo ultimo
+            # publicado. La version exacta queda en el registro (y en logcat: "libheddle.so cargada (... heddle=vX.Y.Z")
+            echo "heddle: $(curl -fsSI https://github.com/43fdfdg45454/heddle/releases/latest | sed -n 's|^location: .*/tag/\(.*\)\r$|\1|ip')"
+            curl -fsSL -o arm/heddle.tar.gz https://github.com/43fdfdg45454/heddle/releases/latest/download/heddle-android-x86_64.tar.gz; echo "descarga heddle (ultima release) -> $?"
+            tar -xzf arm/heddle.tar.gz -C arm; cp "$(find arm -name libheddle.so | head -n1)" arm/libheddle.so
+          fi
+          ci/build-apk.sh x86_64 arm/banco-x86_64.apk; echo "apk x86_64 -> $?"
+          ci/build-apk.sh arm64 arm/banco-arm64.apk; echo "apk arm64 -> $?"
+          ls -l arm/
+          echo "--- QEMU del sistema: rutabaga"; qemu-system-x86_64 -device help 2>&1 | grep -i -c rutabaga
+          echo "--- QEMU del paquete de Google: rutabaga"; G=cf/bin/x86_64-linux-gnu/qemu/qemu-system-x86_64; ldd $G | grep -i "not found"; $G -L cf/usr/share/qemu/x86_64-linux-gnu -device help 2>&1 | grep -i rutabaga
+          echo "--- Vulkan por software disponible"; find cf /usr/share/vulkan -name '*lavapipe*' -o -name '*lvp*' -o -name '*swiftshader*icd*' 2>/dev/null | head
+        } 2>&1 | tee res/herramientas.txt
+        {
+          echo "--- QEMU propio con gfxstream (compilado por la tarea qemu-ubuntu de este mismo pipeline)"
+          mkdir -p qemu-propio && tar -xzf qemu-dl/qemu-propio.tar.gz -C qemu-propio
+          [ -e qemu-propio/lib/librutabaga_gfx_ffi.so.0 ] || ln -s librutabaga_gfx_ffi.so qemu-propio/lib/librutabaga_gfx_ffi.so.0
+          LD_LIBRARY_PATH="$PWD/qemu-propio/lib" ldd qemu-propio/bin/qemu-system-x86_64 | grep -i "not found"
+          LD_LIBRARY_PATH="$PWD/qemu-propio/lib" qemu-propio/bin/qemu-system-x86_64 --version | head -n1
+          LD_LIBRARY_PATH="$PWD/qemu-propio/lib" qemu-propio/bin/qemu-system-x86_64 -device help 2>&1 | grep -i rutabaga
+          echo "--- dispositivos de entrada y de la maquina q35 del QEMU propio (los defectos de weft)"
+          LD_LIBRARY_PATH="$PWD/qemu-propio/lib" qemu-propio/bin/qemu-system-x86_64 -device help 2>&1 | grep -E -i "virtio-multitouch-pci|virtio-keyboard-pci|pcie-root-port|usb-wacom-tablet"
+          LD_LIBRARY_PATH="$PWD/qemu-propio/lib" qemu-propio/bin/qemu-system-x86_64 -machine help 2>&1 | grep -E "^(q35|pc) "
+        } 2>&1 | tee -a res/herramientas.txt
+        # Vulkan por software para Android: weft arranca Cuttlefish sin el lanzador de Google (no hay --gpu_mode de
+        # launch_cvd); con --gpu auto elige gfxstream, que ejecuta el Vulkan del invitado (ro.hardware.vulkan=ranchu) sobre
+        # este lavapipe del anfitrion. El caso vulkan del banco lo usa; sin el controlador se corta aqui, con su motivo
+        ICD="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n1)"
+        echo "GFX_ICD=$ICD" >> "$GITHUB_ENV"; echo "icd: $ICD" >> res/herramientas.txt
+        if [ -z "$ICD" ]; then echo "::error title=Sin Vulkan por software::no esta lavapipe (mesa-vulkan-drivers): Android no tendria Vulkan"; exit 1; fi
+        test -s arm/libheddle.so && test -s arm/banco-x86_64.apk && test -s arm/banco-arm64.apk
+    - name: Primer arranque desde cero (sin herramientas de Google)
+      if: always() && steps.kvm.outputs.kvm == 'si'
+      env:
+        # entrada del CI lanzado a mano (por el entorno, nunca expandida dentro del guion)
+        WEFT_HEDDLE_REF: ${{ github.event.inputs.heddle_ref }}
+      run: |
+        set -o pipefail
+        cargo build --release 2>&1 | tail -n 1
+        mkdir -p res/primer sin-adb
+        # un "adb" falso al frente del PATH: si algo lo llama (la prueba o weft), lo anota y falla; el adb propio de
+        # weft (adb-shell, push, install, logcat, root, remount, disable-verity, reboot, wait-adb) no lo necesita
+        printf '#!/bin/sh\necho "SE USO ADB: $*" >> "%s/res/adb-usado.txt"\nexit 99\n' "$PWD" > sin-adb/adb && chmod +x sin-adb/adb
+        PATH="$PWD/sin-adb:$PATH" WEFT_BRIDGE_LIB="$PWD/arm/libheddle.so" WEFT_ARM_APK="$PWD/arm/banco-arm64.apk" WEFT_BANCO_X86="$PWD/arm/banco-x86_64.apk" WEFT_LIMIT=600 \
+        WEFT_CF_FIRST=1 WEFT_CF_IMAGES="$PWD/cf" WEFT_OUT="$PWD/res/primer" \
+          WEFT_QEMU_DIR="$PWD/qemu-propio" VK_ICD_FILENAMES="$GFX_ICD" VK_DRIVER_FILES="$GFX_ICD" \
+          cargo test --release --test cuttlefish primer_arranque_desde_cero -- --nocapture 2>&1 | tee res/primer/transcripcion.txt
+    - name: Comprobar que no se uso el adb de Google
+      if: always()
+      run: |
+        if [ -e res/adb-usado.txt ]; then cat res/adb-usado.txt; exit 1; fi
+        echo "adb de Google: no se uso (la prueba y weft usaron solo el adb propio)"
+        grep -E "^QEMU: virtio-multitouch-pci|^arranco=|^adb=|^reinicio" res/primer/transcripcion.txt | head -n 8
+    - name: Recortar resultados
+      if: always()
+      run: |
+        sudo chmod -R a+rwX res
+        rm -rf res/*/estado res/*/arranque
+        for w in res/*/audio.wav; do [ -f "$w" ] && tail -c 3000000 "$w" > "$w.cola" && rm "$w"; done
+        ls -l res res/* | head -n 60
+        # los registros enormes se recortan: principio y final
+        for f in res/*.txt res/*/*.txt; do
+          if [ "$(stat -c %s "$f")" -gt 12000000 ]; then ( head -c 4000000 "$f"; echo; echo "[... recortado ...]"; tail -c 6000000 "$f" ) > "$f.r" && mv "$f.r" "$f"; fi
+        done
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-cuttlefish
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+  bibliotecas-fedora:
+    name: bibliotecas gfxstream para el QEMU de Fedora
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Compilar rutabaga + gfxstream en Fedora 44 y probarlos con su QEMU
+      shell: bash {0}
+      run: |
+        mkdir -p res sal
+        docker run --name fed -e GFXSTREAM_REF -e RUTABAGA_REF -v "$PWD/sal:/sal" -v "$PWD:/src:ro" fedora:44 bash -c '
+          dnf install -y --skip-unavailable -q qemu-system-x86 qemu-ui-gtk qemu-ui-sdl qemu-ui-dbus SDL3 freetype fontconfig qemu-audio-pipewire qemu-device-display-virtio-gpu qemu-device-display-virtio-gpu-pci unzip weston procps-ng qemu-device-display-virtio-gpu-rutabaga qemu-device-display-virtio-gpu-pci-rutabaga qemu-device-display-virtio-vga-rutabaga \
+            rutabaga-gfx-ffi rutabaga-gfx-ffi-devel mesa-vulkan-drivers vulkan-loader vulkan-tools \
+            git gcc gcc-c++ meson ninja-build cmake pkgconf-pkg-config cargo rust python3 diffutils \
+            libdrm-devel glm-devel stb_image-devel stb_image_write-devel stb-devel vulkan-headers vulkan-loader-devel mesa-libEGL-devel mesa-libGL-devel libX11-devel libXext-devel wayland-devel libglvnd-devel 2>&1 | tail -n 5
+          echo "=== versiones"; qemu-system-x86_64 --version | head -n1; rpm -q rutabaga-gfx-ffi qemu-device-display-virtio-gpu-rutabaga; rustc --version; meson --version
+          echo "=== QEMU de Fedora tal cual"; timeout 10 qemu-system-x86_64 -machine pc -display none -serial none -monitor none -S -device virtio-gpu-rutabaga,gfxstream-vulkan=on,hostmem=256M 2>&1 | tail -n 3
+          P=/opt/gfx; mkdir -p $P /w; cd /w
+          export PKG_CONFIG_PATH=$P/lib/pkgconfig LD_LIBRARY_PATH=$P/lib
+          # commits fijos (GFXSTREAM_REF y RUTABAGA_REF del env del workflow, los mismos que flatpak/plantillas/app.yml.in): git clone
+          # --depth 1 no sirve para un commit concreto, asi que se baja solo ese commit con init + fetch + checkout
+          clonar() { git init -q "$2" && git -C "$2" fetch -q --depth 1 "$1" "$3" && git -C "$2" checkout -q FETCH_HEAD; }
+          echo "=== gfxstream $GFXSTREAM_REF"; clonar https://github.com/google/gfxstream gfxstream "$GFXSTREAM_REF" || { echo "FALLO: clonar gfxstream en $GFXSTREAM_REF"; exit 1; }; git -C gfxstream log -1 --format="gfxstream %h %cs"
+          meson setup gfxstream/b gfxstream --prefix=$P --libdir=lib -Dbuildtype=release > gfx-conf.log 2>&1 || { tail -n 40 gfx-conf.log; exit 1; }
+          meson install -C gfxstream/b > gfx-build.log 2>&1 || { tail -n 60 gfx-build.log; exit 1; }
+          echo "=== rutabaga $RUTABAGA_REF"; clonar https://github.com/magma-gpu/rutabaga_gfx rutabaga_gfx "$RUTABAGA_REF" || { echo "FALLO: clonar rutabaga_gfx en $RUTABAGA_REF"; exit 1; }; git -C rutabaga_gfx log -1 --format="rutabaga %h %cs"
+          echo "--- diferencias de la interfaz C frente a la de Fedora"; diff <(sed "s/[[:space:]]*$//" /usr/include/rutabaga_gfx/rutabaga_gfx_ffi.h) <(sed "s/[[:space:]]*$//" rutabaga_gfx/ffi/src/include/rutabaga_gfx_ffi.h) | grep -c .
+          # el QEMU de Fedora se compilo con la interfaz 0.1.3, cuya estructura de inicio no tiene el campo final
+          # "renderer_features": la biblioteca no debe leerlo (leeria memoria ajena)
+          sed -i "s|let renderer_features_ptr = builder.renderer_features;|let renderer_features_ptr: *const c_char = std::ptr::null();|" rutabaga_gfx/ffi/src/lib.rs
+          n=$(grep -c "renderer_features_ptr: \*const c_char = std::ptr::null()" rutabaga_gfx/ffi/src/lib.rs); echo "parche renderer_features: $n coincidencia(s)"
+          [ "$n" = 1 ] || { echo "FALLO: el parche sed de renderer_features no quedo aplicado exactamente una vez ($n): cambio rutabaga_gfx/ffi/src/lib.rs en $RUTABAGA_REF, hay que revisar el sed de arriba"; exit 1; }
+          ( cd rutabaga_gfx/ffi && cargo build --release --features gfxstream ) > rut.log 2>&1 || { tail -n 60 rut.log; exit 1; }
+          SO=$(find rutabaga_gfx -name librutabaga_gfx_ffi.so -path "*release*" | head -n1); cp "$SO" $P/lib/librutabaga_gfx_ffi.so.0
+          ls -l $P/lib | grep -E "\.so"; echo "nombre que pide QEMU:"; ldd /usr/lib64/qemu/hw-display-virtio-gpu-rutabaga.so 2>/dev/null | grep -i rutabaga; ls /usr/lib64/qemu | grep -i rutabaga
+          echo "=== QEMU de Fedora + bibliotecas propias"
+          vulkaninfo --summary 2>&1 | grep -E "deviceName" | head -n 2
+          timeout 15 qemu-system-x86_64 -machine pc -display none -serial none -monitor none -S -device virtio-gpu-rutabaga,gfxstream-vulkan=on,hostmem=256M 2>&1 | grep -v "info: \[vk_\|SharedLibrary" | tail -n 12; echo "codigo=${PIPESTATUS[0]}"
+          mkdir -p /sal/gfx && cp -a $P/lib/*.so* /sal/gfx/ && rm -f /sal/gfx/*.a
+          # para LICENSES/ del tar.gz (tarea version): commit exacto y texto de licencia de cada biblioteca (LICENSE o LICENSE.txt)
+          { git -C gfxstream log -1 --format="gfxstream %H %cs https://github.com/google/gfxstream"; git -C rutabaga_gfx log -1 --format="rutabaga_gfx %H %cs https://github.com/magma-gpu/rutabaga_gfx (con el parche de una linea de ci.yml: renderer_features_ptr = null)"; } > /sal/gfx/VERSIONES.txt
+          for f in LICENSE LICENSE.txt; do [ -f gfxstream/$f ] && cp gfxstream/$f /sal/gfx/LICENSE.gfxstream; [ -f rutabaga_gfx/$f ] && cp rutabaga_gfx/$f /sal/gfx/LICENSE.rutabaga; done; cat /sal/gfx/VERSIONES.txt; ls -l /sal/gfx/LICENSE.*
+          echo "=== weft doctor con QEMU de Fedora, qemu-ui-dbus, SDL3 y las bibliotecas recien compiladas (sin KVM en esta tarea: solo se guarda la salida)"
+          dnf install -y -q google-noto-sans-fonts > /dev/null 2>&1 || dnf install -y -q google-noto-sans-vf-fonts > /dev/null 2>&1 || echo "AVISO: no se pudo instalar la fuente Noto Sans"; fc-match "sans-serif:lang=es"
+          cp -r /src /w/src && cd /w/src && cargo build --release 2>&1 | tail -n 1
+          WEFT_GFX_DIR=/sal/gfx target/release/weft doctor > /sal/doctor-bibliotecas.txt 2>&1; echo "doctor codigo=$?" >> /sal/doctor-bibliotecas.txt
+          cat /sal/doctor-bibliotecas.txt
+        ' > res/bibliotecas.txt 2>&1
+        echo "resultado=$?" | tee -a res/bibliotecas.txt
+        tail -n 30 res/bibliotecas.txt
+        sudo cp sal/doctor-bibliotecas.txt res/ 2>/dev/null; sudo chown -R "$USER" res
+        grep -q "Gfxstream initialized successfully" res/bibliotecas.txt || grep -q "codigo=124" res/bibliotecas.txt
+        # lo que cuenta es la ultima orden: bibliotecas generadas, y un doctor que corrio (sin KVM da FALLO en esa fila, lo
+        # esperado en esta tarea) viendo la pantalla D-Bus y SDL3 de los paquetes instalados
+        test -f sal/gfx/librutabaga_gfx_ffi.so.0 && grep -q "^doctor codigo=" res/doctor-bibliotecas.txt && grep -q "^OK  *qemu-ui-dbus" res/doctor-bibliotecas.txt && grep -q "^OK  *SDL3" res/doctor-bibliotecas.txt
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-bibliotecas
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+    - name: Guardar las bibliotecas
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: gfx
+        path: sal/gfx/
+        retention-days: 3
+  fedora-ventanas:
+    name: guion de usuario en Fedora (ventanas y gfxstream)
+    needs: bibliotecas-fedora
+    runs-on: ubuntu-24.04
+    outputs:
+      kvm: ${{ steps.kvm.outputs.kvm }}
+    timeout-minutes: 40
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: KVM
+      id: kvm
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm; sudo modprobe vhost_vsock || true
+        sleep 1
+        if [ -e /dev/kvm ]; then echo "kvm=si" >> "$GITHUB_OUTPUT"; else echo "kvm=no" >> "$GITHUB_OUTPUT"; echo "::warning title=Sin KVM::este ejecutor no tiene /dev/kvm: se omiten las pruebas que lo necesitan y la version no se publica"; fi
+    - name: Bibliotecas de gfxstream
+      uses: actions/download-artifact@v4
+      with:
+        name: gfx
+        path: gfx
+    - name: 'Guion de usuario en Fedora 44: sin ventana, GTK y SDL, con y sin gfxstream'
+      if: steps.kvm.outputs.kvm == 'si'
+      shell: bash {0}
+      run: |
+        mkdir -p res sal
+        docker run --name fed --privileged -v "$PWD/sal:/sal" -v "$PWD:/src:ro" -v "$PWD/gfx:/gfx:ro" fedora:44 bash -c '
+          dnf install -y --skip-unavailable -q qemu-system-x86 qemu-ui-gtk qemu-ui-sdl qemu-ui-dbus qemu-ui-opengl SDL3 freetype fontconfig qemu-audio-pipewire qemu-device-display-virtio-gpu qemu-device-display-virtio-gpu-pci qemu-device-display-virtio-gpu-rutabaga qemu-device-display-virtio-gpu-pci-rutabaga qemu-device-display-virtio-vga-rutabaga rutabaga-gfx-ffi mesa-vulkan-drivers vulkan-loader mesa-libEGL mesa-libGL mesa-dri-drivers unzip weston procps-ng cargo rust 2>&1 | tail -n 3
+          dnf install -y -q google-noto-sans-fonts > /dev/null 2>&1 || dnf install -y -q google-noto-sans-vf-fonts > /dev/null 2>&1 || echo "AVISO: no se pudo instalar la fuente Noto Sans"; fc-match "sans-serif:lang=es"
+          qemu-system-x86_64 --version | head -n1; mkdir -p /w; ls -l /gfx
+          echo "=== paquete weft como el publicado"
+          cp -r /src /w/src && cd /w/src && cargo build --release 2>&1 | tail -n 1
+          mkdir -p /pkg/weft/gfx && cp target/release/weft /pkg/weft/ && cp -r perfiles /pkg/weft/ && cp -a /gfx/*.so* /pkg/weft/gfx/ && ( cd /pkg/weft/gfx && for f in libgfxstream_backend.so.0.*; do ln -sf "$f" libgfxstream_backend.so.0; done )
+          cd /w && ls -l /dev/kvm /dev/vhost-vsock 2>&1
+          echo "=== weft doctor (con KVM: debe terminar con 0)"
+          /pkg/weft/weft doctor > /sal/doctor-ventanas.txt 2>&1; echo "doctor codigo=$?" >> /sal/doctor-ventanas.txt; cat /sal/doctor-ventanas.txt
+          echo "=== guion del usuario, sin ventana, dibujo por software"
+          WEFT_DIR=/pkg/weft WEFT_GPU=virtio-pci WEFT_DISPLAY=none WEFT_AUDIO=none WEFT_WAIT=300 bash /src/scripts/dev-fedora.sh; echo "codigo=$?"
+          cp weft-data/screenshot.png /sal/captura-software.png 2>/dev/null; WEFT_DIR=/pkg/weft bash /src/scripts/dev-fedora.sh parar
+          echo "=== guion del usuario, ventana GTK sobre Wayland (weston sin pantalla), dibujo por software"
+          export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p $XDG_RUNTIME_DIR; chmod 700 $XDG_RUNTIME_DIR
+          weston --backend=headless --socket=wl-prueba > /sal/weston.txt 2>&1 & sleep 4
+          WAYLAND_DISPLAY=wl-prueba GDK_BACKEND=wayland WEFT_DIR=/pkg/weft WEFT_GPU=virtio-pci WEFT_DISPLAY=gtk WEFT_AUDIO=none WEFT_WAIT=300 bash /src/scripts/dev-fedora.sh; echo "codigo=$?"
+          cp weft-data/screenshot.png /sal/captura-gtk.png 2>/dev/null; WEFT_DIR=/pkg/weft bash /src/scripts/dev-fedora.sh parar
+          echo "=== guion del usuario, gfxstream (Vulkan por software de Fedora), ventana GTK"
+          WAYLAND_DISPLAY=wl-prueba GDK_BACKEND=wayland WEFT_DIR=/pkg/weft WEFT_DISPLAY=gtk WEFT_AUDIO=none WEFT_WAIT=200 bash /src/scripts/dev-fedora.sh; echo "codigo=$?"
+          cp weft-data/screenshot.png /sal/captura-gfxstream.png 2>/dev/null; WEFT_DIR=/pkg/weft bash /src/scripts/dev-fedora.sh parar
+          tail -c 3000 weft-data/state/prueba/qemu.log > /sal/qemu-gfxstream.txt 2>/dev/null
+          echo "=== guion del usuario, gfxstream, ventana SDL"
+          WAYLAND_DISPLAY=wl-prueba SDL_VIDEODRIVER=wayland WEFT_DIR=/pkg/weft WEFT_DISPLAY=sdl WEFT_AUDIO=none WEFT_WAIT=200 bash /src/scripts/dev-fedora.sh; echo "codigo=$?"
+          cp weft-data/screenshot.png /sal/captura-gfxstream-sdl.png 2>/dev/null; WEFT_DIR=/pkg/weft bash /src/scripts/dev-fedora.sh parar
+          tail -c 1500 weft-data/state/prueba/qemu.log > /sal/qemu-sdl.txt 2>/dev/null
+        ' > res/ventanas.txt 2>&1
+        echo "resultado=$?" | tee -a res/ventanas.txt
+        sudo cp sal/*.png sal/*.txt res/ 2>/dev/null; sudo chown -R "$USER" res
+        grep -E "^=== guion|^gpu=|arranque_completo|^captura [0-9]|motor grafico|codigo=|ERROR" res/ventanas.txt
+        # las cuatro variantes deben arrancar, todas (tambien las de ventana GTK) con la resolucion pedida y, con gfxstream,
+        # con el motor del anfitrion; weft doctor con KVM termina con 0 (en un solo && para que cuente todo, no solo
+        # la ultima orden: este paso no corre con -e)
+        test "$(grep -c "arranque_completo=si" res/ventanas.txt)" -eq 4 && test "$(grep -c "^captura 720x1348" res/ventanas.txt)" -eq 4 && test "$(grep -c "motor grafico: Virtio-GPU GFXStream" res/ventanas.txt)" -eq 2 && grep -q "^doctor codigo=0" res/ventanas.txt
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-ventanas
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+  fedora-raton:
+    name: raton como toque en Fedora (multitouch y wacom, adb propio)
+    runs-on: ubuntu-24.04
+    outputs:
+      kvm: ${{ steps.kvm.outputs.kvm }}
+    timeout-minutes: 50
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: KVM
+      id: kvm
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm; sudo modprobe vhost_vsock || true
+        sleep 1
+        if [ -e /dev/kvm ]; then echo "kvm=si" >> "$GITHUB_OUTPUT"; else echo "kvm=no" >> "$GITHUB_OUTPUT"; echo "::warning title=Sin KVM::este ejecutor no tiene /dev/kvm: se omiten las pruebas que lo necesitan y la version no se publica"; fi
+    - name: Aplicacion de prueba
+      run: |
+        ci/build-apk.sh x86_64 banco-x86_64.apk && ls -l banco-x86_64.apk
+    - name: Probar en Fedora 44
+      if: steps.kvm.outputs.kvm == 'si'
+      shell: bash {0}
+      run: |
+        mkdir -p res sal
+        # ci/prueba-raton.sh: pasada con los defectos del guion (q35 + multitouch) y pasada con wacom explicito, todo por el
+        # adb propio de weft (esta tarea ya no instala android-tools)
+        docker run --name fed --privileged -v "$PWD/sal:/sal" -v "$PWD:/src:ro" fedora:44 bash -c '
+          dnf install -y --skip-unavailable -q qemu-system-x86 qemu-ui-dbus SDL3 freetype fontconfig qemu-device-display-virtio-gpu qemu-device-display-virtio-gpu-pci qemu-device-usb-host unzip cargo rust procps-ng 2>&1 | tail -n 3
+          dnf install -y -q google-noto-sans-fonts > /dev/null 2>&1 || dnf install -y -q google-noto-sans-vf-fonts > /dev/null 2>&1 || echo "AVISO: no se pudo instalar la fuente Noto Sans"
+          mkdir -p /w && cp -r /src /w/src && cd /w/src && cargo build --release 2>&1 | tail -n 1
+          mkdir -p /pkg/weft && cp target/release/weft /pkg/weft/ && cp -r perfiles /pkg/weft/
+          cd /w && SRC=/src WEFT_DIR=/pkg/weft RES=/sal bash /src/ci/prueba-raton.sh
+        ' > res/raton.txt 2>&1
+        echo "resultado=$?" | tee -a res/raton.txt
+        tail -n 40 res/raton.txt
+        sudo cp sal/* res/ 2>/dev/null; sudo chown -R "$USER" res
+        grep -E "^verificacion|^raton_completo" res/raton.txt
+        # las cuatro verificaciones (doctor, toques multitouch, toques wacom, configuracion wacom persistente) deben salir ok
+        test "$(grep -c '^verificacion [a-z_]*=ok' res/raton.txt)" -eq 4 && ! grep -q '^verificacion [a-z_]*=FALLO' res/raton.txt && grep -q '^raton_completo=ok' res/raton.txt
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-raton
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+  fedora-cow-rsa:
+    name: disco de copia en escritura y adb con RSA en Fedora (adb propio)
+    runs-on: ubuntu-24.04
+    outputs:
+      kvm: ${{ steps.kvm.outputs.kvm }}
+    timeout-minutes: 40
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: KVM
+      id: kvm
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+        sleep 1
+        if [ -e /dev/kvm ]; then echo "kvm=si" >> "$GITHUB_OUTPUT"; else echo "kvm=no" >> "$GITHUB_OUTPUT"; echo "::warning title=Sin KVM::este ejecutor no tiene /dev/kvm: se omiten las pruebas que lo necesitan y la version no se publica"; fi
+    - name: Probar en Fedora 44
+      if: steps.kvm.outputs.kvm == 'si'
+      shell: bash {0}
+      run: |
+        mkdir -p res sal
+        # ci/prueba-cow-rsa.sh: arranque con disk.cow=si (overlay qcow2 sobre la base de la imagen) y, con ro.adb.secure=1, el
+        # adb propio rechazado con una clave desconocida y aceptado con la suya (firma del testigo); adb por TCP
+        docker run --name fed --privileged -v "$PWD/sal:/sal" -v "$PWD:/src:ro" fedora:44 bash -c '
+          dnf install -y --skip-unavailable -q qemu-system-x86 qemu-device-display-virtio-gpu qemu-device-display-virtio-gpu-pci unzip cargo rust procps-ng python3 openssl 2>&1 | tail -n 3
+          mkdir -p /w && cp -r /src /w/src && cd /w/src && cargo build --release 2>&1 | tail -n 1
+          mkdir -p /pkg/weft && cp target/release/weft /pkg/weft/ && cp -r perfiles /pkg/weft/
+          cd /w && SRC=/src WEFT_DIR=/pkg/weft RES=/sal bash /src/ci/prueba-cow-rsa.sh
+        ' > res/cow-rsa.txt 2>&1
+        echo "resultado=$?" | tee -a res/cow-rsa.txt
+        tail -n 40 res/cow-rsa.txt
+        sudo cp sal/* res/ 2>/dev/null; sudo chown -R "$USER" res
+        grep -E "^verificacion" res/cow-rsa.txt | tee res/verificaciones.txt
+        # cow, rsa_sin y rsa: tres verificaciones, todas ok
+        test "$(grep -c '^verificacion [a-z_]*=ok' res/cow-rsa.txt)" -eq 3 && ! grep -q '^verificacion [a-z_]*=FALLO' res/cow-rsa.txt && grep -q '^cow_rsa_completo=ok' res/cow-rsa.txt
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-cow-rsa
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+  fedora-ventana-propia:
+    name: ventana propia en Fedora (SDL3 sin pantalla fisica)
+    needs: bibliotecas-fedora
+    runs-on: ubuntu-24.04
+    outputs:
+      kvm: ${{ steps.kvm.outputs.kvm }}
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: KVM
+      id: kvm
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm; sudo modprobe vhost_vsock || true
+        sleep 1
+        if [ -e /dev/kvm ]; then echo "kvm=si" >> "$GITHUB_OUTPUT"; else echo "kvm=no" >> "$GITHUB_OUTPUT"; echo "::warning title=Sin KVM::este ejecutor no tiene /dev/kvm: se omiten las pruebas que lo necesitan y la version no se publica"; fi
+    - name: Bibliotecas de gfxstream
+      uses: actions/download-artifact@v4
+      with:
+        name: gfx
+        path: gfx
+    - name: 'Guion de usuario con --display window (SDL3 offscreen), cuadros, captura, toque y atajo'
+      if: steps.kvm.outputs.kvm == 'si'
+      shell: bash {0}
+      run: |
+        mkdir -p res sal
+        # ci/prueba-ventana.sh: SDL3 trae el controlador de video "offscreen" y un dibujador por software, asi que la ventana
+        # propia corre sin servidor grafico (no hace falta Xvfb)
+        docker run --name fed --privileged -v "$PWD/sal:/sal" -v "$PWD:/src:ro" -v "$PWD/gfx:/gfx:ro" fedora:44 bash -c '
+          dnf install -y --skip-unavailable -q qemu-system-x86 qemu-ui-dbus SDL3 freetype fontconfig qemu-device-display-virtio-gpu qemu-device-display-virtio-gpu-pci qemu-device-display-virtio-gpu-rutabaga qemu-device-display-virtio-gpu-pci-rutabaga qemu-device-display-virtio-vga-rutabaga rutabaga-gfx-ffi mesa-vulkan-drivers vulkan-loader mesa-libEGL mesa-libGL mesa-dri-drivers unzip procps-ng python3 cargo rust 2>&1 | tail -n 3
+          dnf install -y -q google-noto-sans-fonts > /dev/null 2>&1 || dnf install -y -q google-noto-sans-vf-fonts > /dev/null 2>&1 || echo "AVISO: no se pudo instalar la fuente Noto Sans"
+          qemu-system-x86_64 --version | head -n1; qemu-system-x86_64 -display help | tr "\n" " "; echo; fc-match "sans-serif:lang=es"
+          mkdir -p /w && cp -r /src /w/src && cd /w/src && cargo build --release 2>&1 | tail -n 1
+          mkdir -p /pkg/weft/gfx && cp target/release/weft /pkg/weft/ && cp -r perfiles /pkg/weft/ && cp -a /gfx/*.so* /pkg/weft/gfx/ && ( cd /pkg/weft/gfx && for f in libgfxstream_backend.so.0.*; do ln -sf "$f" libgfxstream_backend.so.0; done )
+          cd /w && ls -l /dev/kvm /dev/vhost-vsock 2>&1
+          SRC=/src WEFT_DIR=/pkg/weft RES=/sal WEFT_WAIT=300 bash /src/ci/prueba-ventana.sh
+        ' > res/ventana-propia.txt 2>&1
+        echo "resultado=$?" | tee -a res/ventana-propia.txt
+        tail -n 40 res/ventana-propia.txt
+        sudo cp -r sal/. res/ 2>/dev/null; sudo chown -R "$USER" res
+        grep -E "^verificacion|^ventana_completa|^arranque_completo|^gpu=" res/ventana-propia.txt
+        # arranque, cuadros, fuente, captura, ajustes, maquina, tema_claro_200, toque, atajo, doctor y config: once verificaciones, todas ok
+        test "$(grep -c '^verificacion [a-z_0-9]*=ok' res/ventana-propia.txt)" -eq 11 && ! grep -q '^verificacion [a-z_0-9]*=FALLO' res/ventana-propia.txt && grep -q '^ventana_completa=ok' res/ventana-propia.txt
+    - name: Resumen legible sin sesion de GitHub
+      if: always()
+      shell: bash {0}
+      run: |
+        {
+          echo "### ventana propia"
+          echo '```'
+          grep -E "^verificacion|^ventana_completa|^arranque_completo|^gpu=|^resultado=" res/ventana-propia.txt 2>/dev/null
+          echo "--- ultimas 60 lineas"
+          tail -n 60 res/ventana-propia.txt 2>/dev/null | cut -c1-300
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-ventana-propia
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+  flatpak:
+    name: paquete Flatpak (.flatpak)
+    needs: semver
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Espacio libre
+      run: |
+        # la construccion y los runtimes de Flathub ocupan varios GB: se libera lo que esta tarea no usa. El borrado (~100 s, son
+        # muchos archivos pequenos) va en segundo plano mientras se restaura la cache y se prepara el contenedor; la construccion
+        # espera a que termine (ver "Construir")
+        df -h / | tail -n 1
+        sudo nohup sh -c 'rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL; touch /tmp/espacio-libre' > /dev/null 2>&1 &
+        mkdir -p res _flatpak-state
+    - name: Cache de la construccion (fuentes y modulos ya compilados)
+      uses: actions/cache@v4
+      with:
+        path: _flatpak-state
+        # la clave lleva el run_id: con una clave fija, un acierto exacto no vuelve a guardar, asi que un estado danado restaurado
+        # se reconstruia en cada pipeline sin guardar nunca el limpio. Asi cada pipeline guarda su estado bueno y el siguiente
+        # restaura el mas reciente (primero uno del mismo manifiesto; si no hay, cualquiera)
+        key: flatpak-${{ hashFiles('flatpak/plantillas/app.yml.in') }}-${{ github.run_id }}
+        restore-keys: |
+          flatpak-${{ hashFiles('flatpak/plantillas/app.yml.in') }}-
+          flatpak-
+    # Ubuntu 24.04 trae Flatpak 1.14, que no conoce --device=input (mandos de juegos, Flatpak >= 1.15.6) y rechaza el manifiesto:
+    # todo el trabajo corre en un contenedor Fedora 44 (Flatpak 1.16 o mas nuevo), como las otras tareas de Fedora.
+    - name: Construir, instalar y probar el paquete (en Fedora 44)
+      shell: bash {0}
+      env:
+        WEFT_VERSION: ${{ needs.semver.outputs.version }}
+      run: |
+        docker pull -q fedora:44 > /dev/null
+        T=0; while [ ! -e /tmp/espacio-libre ] && [ "$T" -lt 300 ]; do sleep 2; T=$((T + 2)); done; echo "espacio libre tras ${T} s de espera: $(df -h / | tail -n 1)"
+        docker run --name fp --privileged -e WEFT_VERSION -v "$PWD:/src" fedora:44 bash -c '
+          set -o pipefail
+          cd /src
+          dnf install -y -q flatpak flatpak-builder appstream desktop-file-utils python3-pyyaml git 2>&1 | tail -n 2
+          # la cache restaurada pertenece al usuario del runner: git (en el estado de flatpak-builder) la rechaza por dueno ajeno ("origin" no existe)
+          chown -R 0:0 /src/_flatpak-state 2>/dev/null; git config --global --add safe.directory "*"
+          flatpak --version; flatpak-builder --version
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          df -h / | tail -n 1
+          echo "=== generar y validar manifiesto, .desktop y metainfo"
+          ok=1
+          SOLO_GENERAR=1 bash flatpak/construir.sh && python3 -c "import sys,yaml; m=yaml.safe_load(open(sys.argv[1])); print(\"manifiesto ok:\", m[\"app-id\"], len(m[\"modules\"]), \"modulos\"); assert \"--share=network\" in m[\"finish-args\"], \"el paquete debe pedir red (internet de Android y adb por TCP entre instancias)\"" flatpak/generado/*.yml && desktop-file-validate flatpak/generado/*.desktop && appstreamcli validate --no-net flatpak/generado/*.metainfo.xml || ok=0
+          echo "generar_validar=$ok"
+          echo "=== construir (QEMU, rutabaga, gfxstream, virtiofsd y weft)"
+          T0=$(date +%s)
+          FLATPAK_BUILDER_EXTRA="--disable-rofiles-fuse" bash flatpak/construir.sh /src/weft.flatpak; rc=$?
+          if [ "$rc" != 0 ]; then
+            # un estado restaurado de la cache puede estar danado: se reintenta una vez desde cero (el registro del primer intento queda arriba)
+            echo "=== primer intento fallido (codigo $rc): se reintenta con el estado vacio"
+            rm -rf /src/_flatpak-state /src/_flatpak-build /src/_flatpak-repo
+            FLATPAK_BUILDER_EXTRA="--disable-rofiles-fuse" bash flatpak/construir.sh /src/weft.flatpak; rc=$?
+          fi
+          echo "construccion_codigo=$rc segundos=$(( $(date +%s) - T0 ))"
+          ls -l /src/weft.flatpak 2>&1; sha256sum /src/weft.flatpak 2>&1
+          [ "$rc" = 0 ] && [ "$ok" = 1 ] && [ -s /src/weft.flatpak ] || { echo "RESULTADO=FALLO (construccion)"; chown -R $(stat -c %u:%g /src) /src 2>/dev/null; exit 1; }
+          echo "=== instalar el paquete"
+          flatpak install --user -y --noninteractive --bundle /src/weft.flatpak 2>&1 | tail -n 5
+          ID=$(sed -n "s/^APP_ID=\"\${APP_ID:-\(.*\)}\"\$/\1/p" flatpak/construir.sh)
+          F=$(flatpak info --user --show-location $ID)/files
+          echo "id=$ID ubicacion=$F"
+          echo "--- contenido del paquete (sin sandbox)"
+          # la salida real del paquete instalado va a res/contenido-flatpak.txt y el test final mira ahi (res/flatpak.txt lleva tambien el
+          # registro de flatpak-builder con las ordenes install de esos mismos nombres, asi que un grep ahi pasaba siempre)
+          { ls $F/qemu/lib | grep -E "rutabaga|gfxstream"; ls -l $F/libexec/virtiofsd $F/bin/weft $F/bin/weft-launch; ls $F/qemu/lib/qemu 2>/dev/null | grep -E "rutabaga|dbus" | head; } 2>&1 | tee /src/res/contenido-flatpak.txt
+          echo "--- permisos que pide el paquete"
+          flatpak info --user --show-permissions $ID
+          echo "--- en el sandbox (si el contenedor permite lanzar Flatpak)"
+          export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p -m 700 $XDG_RUNTIME_DIR
+          flatpak run --command=sh $ID -c "/app/qemu/bin/qemu-system-x86_64 --version | head -n1; /app/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -i rutabaga; /app/qemu/bin/qemu-system-x86_64 -display help 2>&1 | grep -x dbus; ls /app/qemu/lib | grep -E \"rutabaga|gfxstream\"; ls /app/libexec/virtiofsd" > /src/res/sandbox-qemu.txt 2>&1; echo "sandbox_codigo=$?"
+          cat /src/res/sandbox-qemu.txt
+          flatpak run --command=weft $ID doctor > /src/res/doctor-flatpak.txt 2>&1; echo "doctor_codigo=$?"; cat /src/res/doctor-flatpak.txt
+          echo "--- launch sin ninguna imagen instalada (lo que hace el icono del menu): debe terminar con 1 y explicar como agregar una"
+          timeout 60 flatpak run --command=weft $ID launch > /src/res/launch-flatpak.txt 2>&1; echo "launch_codigo=$?"; cat /src/res/launch-flatpak.txt
+          flatpak run --command=weft $ID paths > /src/res/paths-flatpak.txt 2>&1; cat /src/res/paths-flatpak.txt
+          chown -R $(stat -c %u:%g /src) /src 2>/dev/null
+          echo "RESULTADO=OK"
+        ' 2>&1 | tee res/flatpak.txt
+        r=${PIPESTATUS[0]}
+        echo "contenedor_codigo=$r" | tee -a res/flatpak.txt
+        # la prueba que cuenta: construyo, se instalo, el contenido REAL del paquete instalado (res/contenido-flatpak.txt, no el registro de
+        # la construccion, y sin errores de ls) trae rutabaga, gfxstream, virtiofsd, weft y el envoltorio weft-launch, y weft doctor corrio (doctor_codigo). Si el contenedor deja lanzar Flatpak
+        # (sandbox_codigo=0), ademas: el QEMU del sandbox trae el dispositivo de GPU y la pantalla D-Bus (res/sandbox-qemu.txt), doctor ve
+        # ese QEMU (fila qemu-system-x86_64 en OK) y launch sin imagen termina con 1 diciendo que no hay ninguna imagen
+        test "$r" = 0 && grep -q "^RESULTADO=OK" res/flatpak.txt && test -s weft.flatpak \
+          && ! grep -q "cannot access" res/contenido-flatpak.txt && grep -q "librutabaga_gfx_ffi" res/contenido-flatpak.txt && grep -q "libgfxstream_backend" res/contenido-flatpak.txt && grep -qE "^-r.* [^ ]*/libexec/virtiofsd$" res/contenido-flatpak.txt \
+          && grep -q "^doctor_codigo=" res/flatpak.txt \
+          && { ! grep -q "^sandbox_codigo=0" res/flatpak.txt || { grep -qi "virtio-gpu-rutabaga" res/sandbox-qemu.txt && grep -qx "dbus" res/sandbox-qemu.txt && grep -q "^OK  *qemu-system-x86_64" res/doctor-flatpak.txt && grep -q "^launch_codigo=1" res/flatpak.txt && grep -q "ninguna imagen" res/launch-flatpak.txt; }; }
+    - name: Resumen legible sin sesion de GitHub
+      if: always()
+      shell: bash {0}
+      run: |
+        {
+          echo "### paquete Flatpak"
+          echo '```'
+          grep -E "^(flatpak|Flatpak|=== |generar_validar|construccion_codigo|RESULTADO|sandbox_codigo|doctor_codigo|launch_codigo|contenedor_codigo|id=|-rw|manifiesto ok)" res/flatpak.txt | head -n 60
+          echo "--- ultimas 120 lineas"
+          tail -n 120 res/flatpak.txt | cut -c1-300
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: res-flatpak
+        path: res/
+        if-no-files-found: ignore
+        retention-days: 3
+    - name: Guardar el paquete
+      uses: actions/upload-artifact@v4
+      with:
+        name: flatpak
+        path: weft.flatpak
+        retention-days: 3
+  # resultados: SIEMPRE corre (aunque otras tareas fallen; no si se cancelo el pipeline) y deja en el release "ci" el resumen legible sin sesion de GitHub, los registros
+  # de cada tarea (resultados.tar.gz) y las ultimas lineas de lo que suele fallar. No construye ni publica ninguna version.
+  resultados:
+    name: resultados del pipeline
+    # un pipeline cancelado a medias no debe borrar ni recrear el release ci del anterior
+    if: ${{ always() && !cancelled() }}
+    permissions:
+      contents: write
+    needs:
+    - semver
+    - base
+    - qemu-ubuntu
+    - cuttlefish
+    - bibliotecas-fedora
+    - fedora-ventanas
+    - fedora-raton
+    - fedora-cow-rsa
+    - fedora-ventana-propia
+    - flatpak
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        path: art
+    - name: Publicar resultados de todas las tareas
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        mkdir -p todo art
+        for d in art/res-*; do if [ -d "$d" ]; then cp -r "$d" "todo/${d#art/res-}"; fi; done
+        {
+          echo "commit=${{ github.sha }}"
+          echo "base=${{ needs.base.result }}"
+          echo "qemu_ubuntu=${{ needs.qemu-ubuntu.result }}"
+          echo "cuttlefish=${{ needs.cuttlefish.result }}"
+          echo "bibliotecas=${{ needs.bibliotecas-fedora.result }}"
+          echo "ventanas=${{ needs.fedora-ventanas.result }}"
+          echo "raton=${{ needs.fedora-raton.result }}"
+          echo "cow_rsa=${{ needs.fedora-cow-rsa.result }}"
+          echo "ventana_propia=${{ needs.fedora-ventana-propia.result }}"
+          echo "flatpak=${{ needs.flatpak.result }}"
+          # "no": el ejecutor no tenia KVM y las pruebas que lo necesitan se omitieron (ver los avisos del pipeline)
+          echo "kvm=base:${{ needs.base.outputs.kvm }} cuttlefish:${{ needs.cuttlefish.outputs.kvm }} ventanas:${{ needs.fedora-ventanas.outputs.kvm }} raton:${{ needs.fedora-raton.outputs.kvm }} cow_rsa:${{ needs.fedora-cow-rsa.outputs.kvm }} ventana_propia:${{ needs.fedora-ventana-propia.outputs.kvm }}"
+        } | tee todo/resumen.txt
+        {
+          echo "Resumen del pipeline de ${{ github.sha }}:"; echo; echo '```'; cat todo/resumen.txt; echo '```'
+          for f in todo/flatpak/flatpak.txt todo/ventana-propia/ventana-propia.txt; do
+            if [ -f "$f" ]; then echo; echo "Final de $f:"; echo '```'; tail -n 70 "$f" | cut -c1-240; echo '```'; fi
+          done
+          for f in todo/*/verificaciones.txt; do if [ -f "$f" ]; then echo; echo "$f:"; echo '```'; cat "$f"; echo '```'; fi; done
+        } > notas.md
+        head -c 120000 notas.md > notas-corto.md
+        tar -czf resultados.tar.gz -C todo .
+        gh release delete ci --yes --cleanup-tag 2>/dev/null || true
+        gh release create ci resultados.tar.gz todo/resumen.txt --prerelease --latest=false --title "Resultados del ultimo pipeline" --notes-file notas-corto.md
+
+  # version: solo si TODAS las tareas pasaron con KVM (y es un push). Publica vX.Y.Z (la de semver) con el programa, las bibliotecas de gfxstream y el paquete Flatpak.
+  version:
+    name: version
+    permissions:
+      contents: write
+    if: ${{ github.event_name == 'push' && needs.semver.result == 'success' && needs.base.result == 'success' && needs.qemu-ubuntu.result == 'success' && needs.cuttlefish.result == 'success' && needs.bibliotecas-fedora.result == 'success' && needs.fedora-ventanas.result == 'success' && needs.fedora-raton.result == 'success' && needs.fedora-cow-rsa.result == 'success' && needs.fedora-ventana-propia.result == 'success' && needs.flatpak.result == 'success' && needs.base.outputs.kvm == 'si' && needs.cuttlefish.outputs.kvm == 'si' && needs.fedora-ventanas.outputs.kvm == 'si' && needs.fedora-raton.outputs.kvm == 'si' && needs.fedora-cow-rsa.outputs.kvm == 'si' && needs.fedora-ventana-propia.outputs.kvm == 'si' }}
+    needs:
+    - semver
+    - base
+    - qemu-ubuntu
+    - cuttlefish
+    - bibliotecas-fedora
+    - fedora-ventanas
+    - fedora-raton
+    - fedora-cow-rsa
+    - fedora-ventana-propia
+    - flatpak
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/download-artifact@v4
+      with:
+        path: art
+    - name: Publicar version
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        VERSION: ${{ needs.semver.outputs.version }}
+      run: |
+        # VERSION: la que calculo semver con GitVersion y va incrustada en el binario y en el .flatpak. Si la etiqueta ya
+        # existe, no se publica.
+        TAG="v$VERSION"; echo "Version: $TAG"
+        if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then echo "::error::version no valida para publicar: '$VERSION'"; exit 1; fi
+        if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then echo "::error::la etiqueta $TAG ya existe"; exit 1; fi
+        # el paquete incluye las bibliotecas de gfxstream para el QEMU de Fedora (gfx/), que weft usa solo
+        mkdir -p paquete/weft/gfx && cp art/binario/weft paquete/weft/ && chmod +x paquete/weft/weft && cp -r perfiles scripts paquete/weft/
+        cp -a art/gfx/. paquete/weft/gfx/ && test -f paquete/weft/gfx/librutabaga_gfx_ffi.so.0
+        # (los artefactos no conservan enlaces simbolicos: se recrea el nombre que busca el cargador)
+        ( cd paquete/weft/gfx && for f in libgfxstream_backend.so.0.*; do ln -sf "$f" libgfxstream_backend.so.0; done; ls -l )
+        # LICENSES/: la licencia de weft (MIT), las de las dos bibliotecas de gfx/ con sus commits (lo guardo bibliotecas-fedora junto a
+        # los .so; si faltan, mv falla y no se publica) y un THIRD-PARTY.md que dice que es cada cosa
+        mkdir -p paquete/weft/LICENSES && cp LICENSE paquete/weft/LICENSES/LICENSE.weft
+        mv paquete/weft/gfx/LICENSE.gfxstream paquete/weft/gfx/LICENSE.rutabaga paquete/weft/gfx/VERSIONES.txt paquete/weft/LICENSES/
+        cat > paquete/weft/LICENSES/THIRD-PARTY.md <<'EOF'
+        # Software de terceros en weft-linux-x86_64.tar.gz
+
+        weft (el ejecutable `weft`, `perfiles/` y `scripts/`) es software libre bajo la licencia MIT: ver `LICENSE.weft`.
+
+        La carpeta `gfx/` contiene dos bibliotecas de terceros, compiladas por la tarea `bibliotecas-fedora` del pipeline de CI
+        (`.github/workflows/ci.yml`) a partir de un commit fijo de cada repositorio, el mismo que compila el paquete Flatpak (hashes
+        exactos en `VERSIONES.txt`, también al final de este archivo):
+
+        - `librutabaga_gfx_ffi.so.0`: rutabaga_gfx, https://github.com/magma-gpu/rutabaga_gfx, licencia BSD-3-Clause (texto en
+          `LICENSE.rutabaga`). Lleva UN parche de una línea en `ffi/src/lib.rs`, aplicado con sed antes de compilar, para que la
+          biblioteca no lea el campo final `renderer_features` de la estructura de inicio (el QEMU de Fedora se compiló contra la
+          interfaz 0.1.3, que no tiene ese campo):
+
+              sed -i "s|let renderer_features_ptr = builder.renderer_features;|let renderer_features_ptr: *const c_char = std::ptr::null();|" rutabaga_gfx/ffi/src/lib.rs
+
+        - `libgfxstream_backend.so.0` (y su versión completa): gfxstream, https://github.com/google/gfxstream, licencia Apache-2.0
+          (texto en `LICENSE.gfxstream`), sin parches.
+
+        El código fuente de ambas está en los repositorios indicados, en estos commits:
+        EOF
+        { echo; echo '```'; cat paquete/weft/LICENSES/VERSIONES.txt; echo '```'; } >> paquete/weft/LICENSES/THIRD-PARTY.md
+        ls -l paquete/weft/LICENSES
+        tar -C paquete -czf weft-linux-x86_64.tar.gz weft
+        # el paquete Flatpak (con QEMU, rutabaga, gfxstream y virtiofsd dentro) se publica junto al tar.gz
+        cp art/flatpak/weft.flatpak weft-linux-x86_64.flatpak && test -s weft-linux-x86_64.flatpak
+        gh release create "$TAG" weft-linux-x86_64.tar.gz weft-linux-x86_64.flatpak --target "${{ github.sha }}" --title "weft $TAG" --notes "Compilacion automatica de ${{ github.sha }}. weft-linux-x86_64.tar.gz: el programa weft con sus perfiles, el guion de desarrollo y las bibliotecas de aceleracion grafica (gfx/). weft-linux-x86_64.flatpak: el mismo programa con QEMU, rutabaga, gfxstream y virtiofsd dentro. No validado en hardware Android/ARM real. Incluye software de terceros: ver LICENSES/ y THIRD-PARTY.md en el tar.gz (y /app/share/licenses/ en el .flatpak); el .flatpak contiene QEMU 10.2.2 (GPL-2.0), fuentes en https://download.qemu.org/qemu-10.2.2.tar.xz."

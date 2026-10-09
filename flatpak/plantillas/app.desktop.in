@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=weft
+Comment=Emulador de Android con QEMU y KVM
+Comment[es]=Emulador de Android con QEMU y KVM
+Exec=weft-launch
+Icon=@APP_ID@
+Terminal=false
+Categories=System;Emulator;
+Keywords=android;emulator;emulador;qemu;
+StartupNotify=true

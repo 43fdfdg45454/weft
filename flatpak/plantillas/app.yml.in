@@ -1,0 +1,187 @@
+# Manifiesto de Flatpak de weft (paquete .flatpak, no Flathub). Todo va DENTRO del paquete: QEMU de upstream SIN parches,
+# rutabaga y gfxstream (aceleracion grafica por hardware), virtiofsd y weft. La aplicacion no necesita red al ejecutarse.
+#
+# PLANTILLA: flatpak/construir.sh la convierte en generado/<APP_ID>.yml (y los .desktop, metainfo e icono con ese nombre).
+# El identificador provisional se cambia en UN solo lugar: la variable APP_ID al principio de flatpak/construir.sh.
+#
+# Construccion: los fuentes (git/archivos de abajo) y las dependencias de cargo/meson se bajan DURANTE la construccion (por eso
+# los modulos de compilacion llevan --share=network en build-args: valido para un paquete propio, no para Flathub).
+# Cada fuente esta fijada por commit o por sha256.
+app-id: @APP_ID@
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+# La orden del paquete es el envoltorio weft-launch (= `weft launch`, lo mismo que el Exec del .desktop): `flatpak run <id>` arranca la
+# maquina. `weft` a secas solo imprime la ayuda; cualquier otra orden va con `flatpak run --command=weft <id> ORDEN...`.
+command: weft-launch
+
+finish-args:
+  # ventana propia (SDL3 del runtime)
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU del equipo: /dev/dri/*, /dev/nvidia*, /dev/udmabuf (con Nvidia propietaria Flatpak monta la extension GL del controlador)
+  - --device=dri
+  # aceleracion de la maquina virtual
+  - --device=kvm
+  # mandos de juegos (/dev/input/event*; Flatpak >= 1.15.6)
+  - --device=input
+  # audio
+  - --socket=pulseaudio
+  - --filesystem=xdg-run/pipewire-0
+  # red del equipo: internet para Android (red de usuario de QEMU) y la misma 127.0.0.1 en todas las instancias de `flatpak run`, asi que
+  # el adb por TCP de una maquina lo alcanzan las ordenes de cualquier instancia. weft no descarga nada: las imagenes, el acceso root y
+  # el traductor ARM se siguen instalando desde archivos ya descargados.
+  - --share=network
+  # Sin /dev/vhost-vsock ni AF_VSOCK (el filtro seccomp de Flatpak no lo admite): el adb va por TCP (127.0.0.1) automaticamente.
+  # QEMU propio del paquete
+  - --env=WEFT_QEMU_DIR=/app/qemu
+
+# Las licencias de cada modulo (QEMU GPL-2.0-only, libslirp y rutabaga BSD-3-Clause, gfxstream y virtiofsd Apache-2.0, libcap-ng
+# LGPL-2.1-or-later, weft MIT) se instalan en /app/share/licenses/<modulo>/ (con meson, post-install corre en _flatpak_build: por eso
+# se mira tambien en ..); /qemu/share/doc se deja por lo mismo.
+cleanup:
+  - /include
+  - '*.a'
+  - '*.la'
+  - /qemu/include
+  - /qemu/share/man
+  - /qemu/lib/pkgconfig
+  - /qemu/lib/cmake
+
+modules:
+  # libslirp: red de usuario de QEMU (no esta en el runtime)
+  - name: libslirp
+    buildsystem: meson
+    config-opts: [-Ddefault_library=shared]
+    post-install:
+      - for f in COPYING COPYING.LIB LICENSE LICENSE.txt LICENSE-MIT LICENSE-APACHE LICENSE-BSD-3-Clause NOTICE; do for d in . ..; do [ -f "$d/$f" ] && install -Dm644 "$d/$f" "/app/share/licenses/libslirp/$f"; done; done; true
+    sources:
+      - type: git
+        url: https://gitlab.freedesktop.org/slirp/libslirp.git
+        tag: v4.9.1
+        commit: 9c744e1e52aa0d9646ed91d789d588696292c21e
+
+  # libcap-ng: lo pide virtiofsd
+  - name: libcap-ng
+    buildsystem: autotools
+    config-opts: [--without-python3, --disable-static]
+    post-install:
+      - for f in COPYING COPYING.LIB LICENSE LICENSE.txt LICENSE-MIT LICENSE-APACHE LICENSE-BSD-3-Clause NOTICE; do for d in . ..; do [ -f "$d/$f" ] && install -Dm644 "$d/$f" "/app/share/licenses/libcap-ng/$f"; done; done; true
+    sources:
+      - type: git
+        url: https://github.com/stevegrubb/libcap-ng.git
+        tag: v0.8.5
+        commit: f5d39702622208b3ada064d7b2eaeaf1454c9bd3
+
+  # gfxstream: renderizador del anfitrion (Vulkan y GLES del invitado en la GPU real)
+  - name: gfxstream
+    buildsystem: meson
+    builddir: true
+    build-options:
+      build-args: [--share=network]   # subproyectos de meson
+    config-opts: [--prefix=/app/qemu, --libdir=lib, -Dbuildtype=release]
+    post-install:
+      - for f in COPYING COPYING.LIB LICENSE LICENSE.txt LICENSE-MIT LICENSE-APACHE LICENSE-BSD-3-Clause NOTICE; do for d in . ..; do [ -f "$d/$f" ] && install -Dm644 "$d/$f" "/app/share/licenses/gfxstream/$f"; done; done; true
+    sources:
+      - type: git
+        url: https://github.com/google/gfxstream
+        commit: 07ee40efb0e7037a9a9b7fe59071e7c4997e7cbe
+
+  # rutabaga (interfaz C entre QEMU y gfxstream): upstream, SIN parche. Se compila con la misma cabecera con la que despues se
+  # compila QEMU, asi que la estructura de QEMU y la que lee la biblioteca coinciden (el parche de una linea de .github/workflows/ci.yml,
+  # el sed de renderer_features_ptr, solo hace falta con el QEMU de Fedora, compilado contra la cabecera 0.1.3).
+  - name: rutabaga
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      build-args: [--share=network]   # crates de cargo
+      env:
+        CARGO_HOME: /run/build/rutabaga/cargo
+        PKG_CONFIG_PATH: /app/qemu/lib/pkgconfig
+        LD_LIBRARY_PATH: /app/qemu/lib
+    build-commands:
+      - cd ffi && cargo build --release --features gfxstream
+      - install -Dm755 ffi/target/release/librutabaga_gfx_ffi.so /app/qemu/lib/librutabaga_gfx_ffi.so.0 || install -Dm755 target/release/librutabaga_gfx_ffi.so /app/qemu/lib/librutabaga_gfx_ffi.so.0
+      - ln -sf librutabaga_gfx_ffi.so.0 /app/qemu/lib/librutabaga_gfx_ffi.so
+      - install -Dm644 ffi/src/include/rutabaga_gfx_ffi.h /app/qemu/include/rutabaga_gfx/rutabaga_gfx_ffi.h
+      - |
+        V="$(grep -m1 '^version' ffi/Cargo.toml | cut -d'"' -f2)"
+        mkdir -p /app/qemu/lib/pkgconfig
+        printf 'prefix=/app/qemu\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: rutabaga_gfx_ffi\nDescription: Rutabaga FFI\nVersion: %s\nLibs: -L${libdir} -lrutabaga_gfx_ffi\nCflags: -I${includedir}\n' "${V:-0.1.85}" > /app/qemu/lib/pkgconfig/rutabaga_gfx_ffi.pc
+      - for f in COPYING COPYING.LIB LICENSE LICENSE.txt LICENSE-MIT LICENSE-APACHE LICENSE-BSD-3-Clause NOTICE; do for d in . ..; do [ -f "$d/$f" ] && install -Dm644 "$d/$f" "/app/share/licenses/rutabaga/$f"; done; done; true
+    sources:
+      - type: git
+        url: https://github.com/magma-gpu/rutabaga_gfx
+        commit: ced6af5b1135173c269a037e06213e8a263de271
+
+  # QEMU de upstream, sin parches, solo x86_64, con modulos (ui-dbus, virtio-gpu-rutabaga, audio pipewire/pulse...)
+  - name: qemu
+    buildsystem: simple
+    build-options:
+      env:
+        PKG_CONFIG_PATH: /app/qemu/lib/pkgconfig:/app/lib/pkgconfig
+        LD_LIBRARY_PATH: /app/qemu/lib
+    build-commands:
+      - |
+        mkdir -p build && cd build
+        ../configure --prefix=/app/qemu --libdir=/app/qemu/lib \
+          --extra-ldflags='-Wl,-rpath,/app/qemu/lib' \
+          --target-list=x86_64-softmmu --enable-kvm --enable-modules \
+          --enable-rutabaga-gfx --enable-dbus-display --enable-slirp --enable-vhost-user \
+          --audio-drv-list=pa,pipewire --disable-gtk --disable-sdl --disable-docs --disable-werror \
+          --disable-user --disable-tools --disable-guest-agent --disable-fdt
+        make -j"$FLATPAK_BUILDER_N_JOBS"
+        make install
+      - for f in COPYING COPYING.LIB LICENSE LICENSE.txt LICENSE-MIT LICENSE-APACHE LICENSE-BSD-3-Clause NOTICE; do for d in . ..; do [ -f "$d/$f" ] && install -Dm644 "$d/$f" "/app/share/licenses/qemu/$f"; done; done; true
+    sources:
+      - type: archive
+        url: https://download.qemu.org/qemu-10.2.2.tar.xz
+        sha256: 784b296ff29c1417aa72323abcb2d2ea9ab9771724f577dcd785c3b04f21e176
+
+  # virtiofsd: carpetas compartidas (weft lo lanza con --sandbox none: no necesita user namespaces)
+  - name: virtiofsd
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      build-args: [--share=network]   # crates de cargo
+      env:
+        CARGO_HOME: /run/build/virtiofsd/cargo
+        RUSTFLAGS: -L native=/app/lib
+    build-commands:
+      - cargo build --release
+      - install -Dm755 target/release/virtiofsd /app/libexec/virtiofsd
+      - for f in COPYING COPYING.LIB LICENSE LICENSE.txt LICENSE-MIT LICENSE-APACHE LICENSE-BSD-3-Clause NOTICE; do for d in . ..; do [ -f "$d/$f" ] && install -Dm644 "$d/$f" "/app/share/licenses/virtiofsd/$f"; done; done; true
+    sources:
+      - type: git
+        url: https://gitlab.com/virtio-fs/virtiofsd.git
+        tag: v1.14.0
+        commit: c2540f8db14caba81c1e37fba23fc7bf2cd7f0dd
+
+  # weft (sin crates: compila sin red)
+  - name: weft
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/weft/cargo
+        # version que calcula GitVersion (la pone flatpak/construir.sh)
+        WEFT_VERSION: "@VERSION@"
+    build-commands:
+      - cargo build --release --offline
+      - install -Dm755 target/release/weft /app/bin/weft
+      # envoltorio de `weft launch`: la orden del paquete (command) y la del .desktop
+      - |
+        printf '#!/bin/sh\nexec /app/bin/weft launch "$@"\n' > weft-launch
+        install -Dm755 weft-launch /app/bin/weft-launch
+      - install -Dm644 flatpak/generado/@APP_ID@.desktop /app/share/applications/@APP_ID@.desktop
+      - install -Dm644 flatpak/generado/@APP_ID@.metainfo.xml /app/share/metainfo/@APP_ID@.metainfo.xml
+      - install -Dm644 flatpak/generado/@APP_ID@.svg /app/share/icons/hicolor/scalable/apps/@APP_ID@.svg
+      - install -Dm644 LICENSE /app/share/licenses/weft/LICENSE
+    sources:
+      - type: dir
+        path: ../..
+        # las mismas carpetas de trabajo de CI y de ci/build-qemu.sh que ignora .gitignore (ahi tambien *.log y los tar.gz/apk de la raiz)
+        skip: [target, .git, tmp, weft-data, _flatpak-state, _flatpak-build, _flatpak-repo, res, art, _qemu_build, gfxstream, rutabaga_gfx, qemu, paquete, qemu-dl, qemu-propio, cf, arm, sal, sin-adb, todo, gfx]

@@ -1,0 +1,19 @@
+[package]
+name = "weft"
+version = "0.1.0"
+edition = "2021"
+description = "Emulador minimo: lanza y controla una maquina virtual QEMU + KVM por comandos"
+license = "MIT"
+authors = ["43fdfdg45454"]
+repository = "https://github.com/43fdfdg45454/weft"
+readme = "README.md"
+publish = false
+# Cargo.lock en formato 4: hace falta cargo 1.78 o mas nuevo
+rust-version = "1.78"
+
+[[bin]]
+name = "weft"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2

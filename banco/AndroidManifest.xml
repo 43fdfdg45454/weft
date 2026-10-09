@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="rs.weft.banco" android:versionCode="1" android:versionName="1">
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="35" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+    <application android:label="Banco de pruebas" android:extractNativeLibs="true" android:hasCode="true" android:usesCleartextTraffic="true">
+        <activity android:name=".Main" android:exported="true" android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- NativeActivity con biblioteca (libbanconativa.so) y punto de entrada (banco_nativa_crear) propios, no los de
+             siempre (libmain.so, ANativeActivity_onCreate), en su propio proceso: ver jni/nativa.c -->
+        <activity android:name="android.app.NativeActivity" android:process=":nativa" android:exported="true" android:label="Banco nativo"
+                  android:screenOrientation="portrait" android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden">
+            <meta-data android:name="android.app.lib_name" android:value="banconativa" />
+            <meta-data android:name="android.app.func_name" android:value="banco_nativa_crear" />
+        </activity>
+        <!-- casos de bajo nivel en su propio proceso: si mueren, el proceso principal sigue (Main.enProceso) -->
+        <service android:name=".Bajo" android:process=":bajo" android:exported="false" />
+    </application>
+</manifest>

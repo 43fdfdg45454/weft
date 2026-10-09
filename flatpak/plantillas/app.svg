@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>weft</title>
+  <defs>
+    <linearGradient id="fondo" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2a4e"/>
+      <stop offset="1" stop-color="#0f5c5a"/>
+    </linearGradient>
+    <linearGradient id="hilo1" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#ff6f61"/>
+    </linearGradient>
+    <linearGradient id="hilo2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7ee8c7"/>
+      <stop offset="1" stop-color="#3fb6e8"/>
+    </linearGradient>
+    <clipPath id="pantalla">
+      <rect x="44" y="30" width="40" height="60" rx="4"/>
+    </clipPath>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#fondo)"/>
+  <rect x="8.5" y="8.5" width="111" height="111" rx="27.5" fill="none" stroke="#ffffff" stroke-opacity="0.12"/>
+  <!-- telefono -->
+  <rect x="36" y="20" width="56" height="88" rx="12" fill="#0b1426"/>
+  <rect x="36" y="20" width="56" height="88" rx="12" fill="none" stroke="#e8eef8" stroke-opacity="0.85" stroke-width="2.5"/>
+  <rect x="44" y="30" width="40" height="60" rx="4" fill="#13213d"/>
+  <!-- tejido: urdimbre vertical y trama (weft) horizontal que pasa por encima y por debajo -->
+  <g clip-path="url(#pantalla)">
+    <g stroke="#e8eef8" stroke-opacity="0.35" stroke-width="3">
+      <line x1="50" y1="28" x2="50" y2="92"/>
+      <line x1="58" y1="28" x2="58" y2="92"/>
+      <line x1="66" y1="28" x2="66" y2="92"/>
+      <line x1="74" y1="28" x2="74" y2="92"/>
+      <line x1="82" y1="28" x2="82" y2="92"/>
+    </g>
+    <path d="M40 44 Q46 40 50 44 T58 44 T66 44 T74 44 T82 44 T90 44" fill="none" stroke="url(#hilo1)" stroke-width="5" stroke-linecap="round"/>
+    <path d="M40 60 Q46 64 50 60 T58 60 T66 60 T74 60 T82 60 T90 60" fill="none" stroke="url(#hilo2)" stroke-width="5" stroke-linecap="round"/>
+    <path d="M40 76 Q46 72 50 76 T58 76 T66 76 T74 76 T82 76 T90 76" fill="none" stroke="url(#hilo1)" stroke-width="5" stroke-linecap="round"/>
+    <!-- la urdimbre vuelve a pasar por encima en los cruces alternos -->
+    <g stroke="#e8eef8" stroke-opacity="0.75" stroke-width="3">
+      <line x1="58" y1="40" x2="58" y2="48"/>
+      <line x1="74" y1="40" x2="74" y2="48"/>
+      <line x1="50" y1="56" x2="50" y2="64"/>
+      <line x1="66" y1="56" x2="66" y2="64"/>
+      <line x1="82" y1="56" x2="82" y2="64"/>
+      <line x1="58" y1="72" x2="58" y2="80"/>
+      <line x1="74" y1="72" x2="74" y2="80"/>
+    </g>
+  </g>
+  <rect x="56" y="97" width="16" height="3.5" rx="1.75" fill="#e8eef8" fill-opacity="0.85"/>
+</svg>

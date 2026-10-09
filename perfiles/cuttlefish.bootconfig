@@ -1,0 +1,56 @@
+# Parametros de arranque para la imagen Cuttlefish (aosp_cf_x86_64_only_phone) sobre QEMU estandar.
+# Son los que genera el lanzador de Google para esta imagen. Varios servicios de Android abortan si falta el suyo,
+# aunque el servicio del anfitrion al que apuntan no exista: por eso se conservan todos.
+# Origen: parametros que genera el lanzador de dispositivos virtuales de AOSP (Apache-2.0) para esta imagen; aqui solo la lista clave=valor.
+
+# el disco del sistema va en la ranura PCI 4 (weft start --disk-slot 4)
+androidboot.boot_devices=pci0000:00/0000:00:04.0
+androidboot.fstab_suffix=cf.f2fs.hctr2
+androidboot.serialno=WEFT0001
+androidboot.serialconsole=0
+androidboot.setupwizard_mode=DISABLED
+androidboot.enable_bootanimation=1
+androidboot.hw_timeout_multiplier=3
+androidboot.lcd_density=280
+androidboot.ddr_size=4915MB
+
+# graficos: el motor (egl, vulkan) lo agrega weft segun --gpu: gfxstream usa la GPU del anfitrion y el resto
+# de los modos dibuja por software dentro de Android
+androidboot.hardware.hwcomposer=ranchu
+androidboot.hardware.hwcomposer.display_finder_mode=drm
+# orden de color que espera la pantalla de QEMU (con rgba, rojo y azul salen intercambiados)
+androidboot.hardware.hwcomposer.display_framebuffer_format=bgra
+androidboot.hardware.gralloc=minigbm
+androidboot.hardware.angle_feature_overrides_enabled=mapUnspecifiedColorSpaceToPassThrough
+androidboot.hardware.angle_feature_overrides_disabled=exposeES32ForTesting
+androidboot.opengles.version=196609
+androidboot.vendor.apex.com.android.hardware.graphics.composer=com.android.hardware.graphics.composer.ranchu
+
+# seguridad: implementaciones dentro del invitado (no dependen de servicios del anfitrion)
+androidboot.vendor.apex.com.android.hardware.keymint=com.android.hardware.keymint.rust_nonsecure
+androidboot.vendor.apex.com.android.hardware.gatekeeper=com.android.hardware.gatekeeper.nonsecure
+androidboot.vendor.apex.com.android.hardware.weaver=none
+androidboot.vendor.apex.com.android.hardware.strongbox=none
+androidboot.vendor.apex.com.android.hardware.secure_element=com.android.hardware.secure_element
+androidboot.vendor.apex.com.google.emulated.camera.provider.hal=com.google.emulated.camera.provider.hal
+androidboot.enable_confirmationui=0
+androidboot.hypervisor.vm.supported=1
+androidboot.hypervisor.protected_vm.supported=0
+androidboot.hypervisor.version=cf-qemu_cli
+
+# canales hacia servicios del anfitrion (luces, modem, radio, registros de fallos): sin nadie al otro lado
+androidboot.vsock_lights_port=6900
+androidboot.vsock_lights_cid=3
+androidboot.vsock_tombstone_port=6600
+androidboot.vhal_proxy_server_port=9300
+androidboot.modem_simulator_ports=9600
+androidboot.vendor.audiocontrol.server.port=9410
+androidboot.vendor.audiocontrol.server.cid=3
+androidboot.openthread_node_id=1
+androidboot.wifi_impl=mac80211_hwsim_virtio
+androidboot.wifi_mac_prefix=5554
+
+# lo que anade el cargador de arranque: ranura A, arranque normal, dispositivo desbloqueado
+androidboot.slot_suffix=_a
+androidboot.force_normal_boot=1
+androidboot.verifiedbootstate=orange

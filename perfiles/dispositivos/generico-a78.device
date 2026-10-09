@@ -1,0 +1,27 @@
+# Perfil de dispositivo integrado: lo que weft ANUNCIA a Android y a las apps ARM (no lo que el traductor implementa).
+# Formato: clave=valor, una por linea; solo lineas enteras de comentario (#). Ver README («Perfiles de dispositivo»).
+# Para cambiarlo: duplicarlo (`weft device new ID --from generico-a78` o el boton Duplicar de la configuracion).
+dispositivo.formato=1
+dispositivo.id=generico-a78
+dispositivo.nombre=Genérico A78
+dispositivo.descripcion=Núcleo de gama alta ARMv8.2 (Cortex-A78 r1p1) con las extensiones que anuncia Linux en ese núcleo.
+
+# --- identidad (ro.product.*): vacio = la de la imagen de Android
+producto.fabricante=
+producto.marca=
+producto.modelo=
+producto.dispositivo=
+producto.nombre=
+
+# --- maquina virtual: nucleos (-smp) y memoria en MiB (-m); auto = lo que diga la configuracion o el arranque
+maquina.nucleos=8
+maquina.ram=6144
+# tamano de pagina anunciado a las apps ARM, en KiB (4 o 16)
+pagina=4
+
+# --- CPU anunciada (registros de identificacion y AT_HWCAP)
+cpu.nombre=Cortex-A78
+# modelo de partida de heddle (cortex-a53/a55/a76/a77/a78/x1, max); features y registros lo modifican
+cpu.base=cortex-a78
+cpu.midr=0x411fd411
+cpu.features=fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp ssbs

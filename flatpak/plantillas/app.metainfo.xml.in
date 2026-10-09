@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>@APP_ID@</id>
+  <name>weft</name>
+  <summary>Emulador de Android con QEMU y KVM</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- weft es MIT; el paquete lleva dentro QEMU (GPL-2.0-only), gfxstream y virtiofsd (Apache-2.0), libslirp y rutabaga (BSD-3-Clause) y libcap-ng (LGPL-2.1-or-later) -->
+  <project_license>MIT AND GPL-2.0-only AND Apache-2.0 AND BSD-3-Clause AND LGPL-2.1-or-later</project_license>
+  <developer id="io.github.43fdfdg45454"><name>43fdfdg45454</name></developer>
+  <description>
+    <p>Emulador de Android para Linux, escrito en Rust. Lanza una maquina virtual con QEMU y KVM, con la GPU del equipo, ventana propia, mandos de juegos y carpetas compartidas.</p>
+    <p>La aplicacion no descarga nada: la imagen de Android se agrega desde un archivo (zip o carpeta) que ya tengas en el equipo. Usa la red del equipo para dar internet a Android.</p>
+  </description>
+  <launchable type="desktop-id">@APP_ID@.desktop</launchable>
+  <url type="homepage">https://github.com/43fdfdg45454/weft</url>
+  <url type="bugtracker">https://github.com/43fdfdg45454/weft/issues</url>
+  <url type="vcs-browser">https://github.com/43fdfdg45454/weft</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@FECHA@"/>
+  </releases>
+</component>

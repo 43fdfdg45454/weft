@@ -1,0 +1,14 @@
+# Perfil de dispositivo integrado (ver generico-a78.device para el formato). Hereda del A78 y cambia el nucleo y los
+# recursos: `dispositivo.hereda` toma todas las claves del padre y estas las sustituyen.
+dispositivo.formato=1
+dispositivo.id=generico-x1
+dispositivo.hereda=generico-a78
+dispositivo.nombre=Genérico X1
+dispositivo.descripcion=Núcleo de máximo rendimiento ARMv8.2 (Cortex-X1 r1p0), mismas extensiones que el A78.
+
+maquina.nucleos=8
+maquina.ram=8192
+
+cpu.nombre=Cortex-X1
+cpu.base=cortex-x1
+cpu.midr=0x411fd440
